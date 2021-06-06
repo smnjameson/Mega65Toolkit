@@ -13,6 +13,8 @@
 		ldx #<FileName
 		ldy #>FileName
 		jsr FLOPPYIO.LoadFile
+		lda #$00
+		tab
 }
 
 
@@ -28,7 +30,7 @@ FLOPPYIO: {
 	PotentialTrack:		.byte $00
 	PotentialSector:	.byte $00
 	SectorHalf:			.byte $00
-
+	OrigBase:			.byte $00
 
 
 	SetLoadAddress: {
@@ -39,6 +41,8 @@ FLOPPYIO: {
 	}
 
 	LoadFile: {
+			// tba
+			// sta OrigBase
 		  	lda #BASEPAGE
 	  		tab 
 
@@ -53,8 +57,10 @@ FLOPPYIO: {
 		!:
 
 			//Read first directory
-		  	ldx $d087 //track
-		  	ldy $d087 //Sector
+			jsr CopyToBuffer 
+		  	ldx $0200 //track
+		  	ldy $0201 //sector
+
 		!NextDirectoryPage:
 			jsr FetchNext
 			jsr CopyToBuffer
