@@ -1,22 +1,92 @@
 * = * "Floppy IO code"
 
+.const SDFILENAME = $0200 //-$03ff
+.const HVC_SD_TO_CHIPRAM = $36
+.const HVC_SD_TO_ATTICRAM = $3e
+
 .macro FLOPPY_LOAD(addr, fname) {
 		bra !+
 	FileName:
 		.text fname
 		.byte $00
-	!:
+	!:	
+		lda #[addr >> 20]
+		sta FLOPPYIO.SetLoadAddress.MBank
 		lda #<addr				
 		ldx #>addr
-		ldy #[[addr & $ff0000] >> 16]
+		ldy #[[addr & $f0000] >> 16]
 		jsr FLOPPYIO.SetLoadAddress
 		ldx #<FileName
 		ldy #>FileName
 		jsr FLOPPYIO.LoadFile
-		lda #$00
-		tab
 }
 
+
+.macro SD_LOAD_CHIPRAM(addr, fname) {
+		bra !+
+	FileName:
+		.text fname
+		.byte $00
+	!:	
+		lda #>FileName 
+		ldx #<FileName 
+		jsr SDIO.CopyFileName
+
+		ldx #<addr
+		ldy #>addr
+		ldz #[[addr & $ff0000] >> 16]
+
+		lda #HVC_SD_TO_CHIPRAM
+		sta $d640 
+		nop
+
+}
+
+.macro SD_LOAD_ATTICRAM(addr, fname) {
+		bra !+
+	FileName:
+		.text fname
+		.byte $00
+	!:	
+		lda #>FileName 
+		ldx #<FileName 
+		jsr SDIO.CopyFileName
+
+		ldx #<addr
+		ldy #>addr
+		ldz #[[addr & $ff0000] >> 16]
+
+		lda #HVC_SD_TO_ATTICRAM
+		sta $d640 
+		nop
+}
+
+
+
+
+SDIO: {
+	CopyFileName: {
+		sta FileName + 1
+		stx FileName + 0
+
+		ldx #$00
+	!:
+		lda FileName:$BEEF, x 
+		sta SDFILENAME, x 
+		inx
+		bne !-
+
+		
+
+		//Make hypervisor call to set filename to load
+		ldx #<SDFILENAME
+		ldy #>SDFILENAME
+		lda #$2e	
+		sta $d640 
+		nop
+		rts
+	}
+}
 
 
 FLOPPYIO: {
@@ -30,19 +100,27 @@ FLOPPYIO: {
 	PotentialTrack:		.byte $00
 	PotentialSector:	.byte $00
 	SectorHalf:			.byte $00
-	OrigBase:			.byte $00
+
 
 
 	SetLoadAddress: {
 			sta DMACopyToDest + 0
 			stx DMACopyToDest + 1
-			sty DMACopyToDest + 2
+				
+			sty Ory
+			lda DMACopyToDest + 2
+			and #$f0
+			ora Ory:#$BEEF
+			sta DMACopyToDest + 2
+
+			lda MBank:#$BEEF
+			sta DMACopyToDestination + 4
 			rts
 	}
 
 	LoadFile: {
-			// tba
-			// sta OrigBase
+			tba 
+			sta RestBP
 		  	lda #BASEPAGE
 	  		tab 
 
@@ -147,6 +225,8 @@ FLOPPYIO: {
 	FloppyExit:
 			lda #$00
 			sta $d080
+			lda RestBP:#$BEEF
+			tab 
 			rts		
 	
 
