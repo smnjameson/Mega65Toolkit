@@ -4,23 +4,6 @@
 .const HVC_SD_TO_CHIPRAM = $36
 .const HVC_SD_TO_ATTICRAM = $3e
 
-.macro FLOPPY_LOAD(addr, fname) {
-		bra !+
-	FileName:
-		.text fname
-		.byte $00
-	!:	
-		lda #[addr >> 20]
-		sta FLOPPYIO.SetLoadAddress.MBank
-		lda #<addr				
-		ldx #>addr
-		ldy #[[addr & $f0000] >> 16]
-		jsr FLOPPYIO.SetLoadAddress
-		ldx #<FileName
-		ldy #>FileName
-		jsr FLOPPYIO.LoadFile
-}
-
 
 .macro SD_LOAD_CHIPRAM(addr, fname) {
 		bra !+
@@ -89,348 +72,606 @@ SDIO: {
 }
 
 
-FLOPPYIO: {
-	.align $10 //Keep these vars bytes from crossing a page
+
+
+.macro FLOPPY_LOAD(addr, fname) {
+		bra !+
+	FileName:
+		.text fname
+	!:
+		jsr ClearFilename
 	
-	.const BASEPAGE = >*
-	FileNamePtr:		.word $0000
-	BufferPtr:			.word $0000
-	NextTrack:			.byte $00
-	NextSector:			.byte $00
-	PotentialTrack:		.byte $00
-	PotentialSector:	.byte $00
-	SectorHalf:			.byte $00
+		lda #<FileName 
+		sta CopyFileName.sm_fname + 0
+		lda #>FileName 
+		sta CopyFileName.sm_fname + 1
+		lda #fname.size()
+		sta CopyFileName.sm_size
+
+		jsr CopyFileName
+		// Set load address (32-bit)
+		// = $07ff ($0801 - 2 bytes for BASIC header)
+		lda #<addr 
+		sta fastload_address+0
+		lda #>addr 
+		sta fastload_address+1
+		lda #[[addr >> 16] & $ff]
+		sta fastload_address+2
+		lda #[[addr >> 24] & $ff]
+		sta fastload_address+3	
+		jsr FastLoader
+}
 
 
+FastLoader: {
+	// Call fastload and flash borders
+	wait_for_fastload:	
+		//Give the fastload time to get itself sorted
+		//(largely seeking to track 0)
+		jsr FastloadCall
+		lda fastload_request
+		bne wait_for_fastload	
 
-	SetLoadAddress: {
-			sta DMACopyToDest + 0
-			stx DMACopyToDest + 1
-				
-			sty Ory
-			lda DMACopyToDest + 2
-			and #$f0
-			ora Ory:#$BEEF
-			sta DMACopyToDest + 2
+		// // Request fastload job
+		lda #$01
+		sta fastload_request
+	
+		// // Then just wait for the request byte to
+		// // go back to $00, or to report an error by having the MSB
+		// // set. The request value will continually update based on the
+		// // state of the loading.
+		waiting:
+			jsr FastloadCall
+			lda fastload_request
+			bmi error
+			bne waiting
+			beq done
+			
+		error:
+			inc $d020
+			jmp error
 
-			lda MBank:#$BEEF
-			sta DMACopyToDestination + 4
-			rts
-	}
-
-	LoadFile: {
-			tba 
-			sta RestBP
-		  	lda #BASEPAGE
-	  		tab 
-
-			stx <[FileNamePtr + 0]
-			sty <[FileNamePtr + 1]
-
-			//First get directory listing track/sector
-			ldx #40
-			ldy #0
-			jsr ReadSector
-			bcs !FileNotFoundError+
-		!:
-
-			//Read first directory
-			jsr CopyToBuffer 
-		  	ldx $0200 //track
-		  	ldy $0201 //sector
-
-		!NextDirectoryPage:
-			jsr FetchNext
-			jsr CopyToBuffer
-
-	  		//Get first entry  pointer to next track/sector
-	  		ldy #$00 
-	  		ldx #$00 //Store For beginning of entry
-	  	!LoopEntry:
-	  		lda (<BufferPtr), y
-	  		beq !+	//Dont store next track if 0
-	  		sta <NextTrack
-	  	!:
-	  		iny
-
-	  		lda (<BufferPtr), y
-	  		beq !+ //Dont store next sector if 0
-	  		sta <NextSector
-	  	!:
-	  		iny
-
-	  		//FileType 
-	  		lda (<BufferPtr), y
-	  		iny
-
-	  		//Get this entries track/sector info
-	  		lda (<BufferPtr), y
-	  		beq !FileNotFoundError+ //Track 00 implies no file here
-	  		sta <PotentialTrack
-	  		iny
-
-	  		lda (<BufferPtr), y
-	  		sta <PotentialSector
-	  		iny
-	  		
-
-	  		ldz #$00
-	  	!FilenameLoop:
-			lda (<BufferPtr), y
-			cmp #$a0
-			beq !FileFound+
-			cmp (<FileNamePtr), z 
-			bne !NextEntry+
-			iny
-			inz 
-			cpz #$10
-			bne !FilenameLoop-
-
-		!FileFound:
-			txa 
-			clc 
-			adc #$1e 
-			tay 
-
-			//If a match set track/sector
-			lda <PotentialTrack
-			sta <NextTrack
-			lda <PotentialSector
-			sta <NextSector
-
-			jmp FetchFile
-
-	  	!NextEntry:
-	  		//advance $20 bytes to next entry
-	  		txa 
-	  		clc
-	  		adc #$20 
-	  		tax 
-	  		tay
-	  		bcc !LoopEntry-
-
-	  		//If crossing page is it still in the sector buffer?
-	  		jsr AdvanceSectorPointer //Returns 0 if we need to fetch next sector buffer
-	  		bne !LoopEntry-
-
-	  		//Otherwise we need to fetch new sector buffer
-	  		ldx <NextTrack
-	  		ldy <NextSector
-	  		jmp !NextDirectoryPage-
-
-		!FileNotFoundError:
-			//Fall through into Floppy error below
-	}
-	FloppyError:
-	FloppyExit:
+		done:
+			//exit
 			lda #$00
 			sta $d080
-			lda RestBP:#$BEEF
-			tab 
-			rts		
+			rts
+
+	FastloadCall:
+			lda #$01
+			sta $d020
+			jsr fastload_irq
+			lda #$00
+			sta $d020
+			rts
+}
+
+
+ClearFilename: {
+		//First clear the filename
+		ldx #$0f
+		lda #$a0
+	clearfilename:
+		sta fastload_filename,x
+		dex
+		bpl clearfilename
+		rts
+}
+
+CopyFileName: {
+		//copy filename from start of screen
+		//Expected to be PETSCII and $A0 padded at end, and exactly 16 chars
+		ldx #$ff
+	filenamecopyloop:
+		inx
+		cpx sm_size:#$BEEF
+		beq endofname
+		lda sm_fname:$BEEF,x
+		beq endofname
+		sta fastload_filename,x
+		bne filenamecopyloop
+	endofname:	
+		ldx #$11
+		stx fastload_filename_len		
+		rts
+}
+
+
+// ----------------------------------------------------------------------------
+// ----------------------------------------------------------------------------
+// ----------------------------------------------------------------------------
+.label fastload_sector_buffer = $0200
+	// *=*+512
+
+	// ------------------------------------------------------------
+	// Actual fast-loader code
+	// ------------------------------------------------------------
+fastload_filename:	
+	.fill 16, $a0
+fastload_filename_len:		.byte 0
+fastload_address:			.byte 0,0,0,0
+// Start with seeking to track 0
+fastload_request:			.byte 4
+// Remember the state that requested a sector read
+fastload_request_stashed:	.byte 0
+fl_current_track:			.byte 0
+fl_file_next_track:			.byte 0
+fl_file_next_sector:		.byte 0
+prev_track:					.byte 0
+prev_sector:				.byte 0
+prev_side:					.byte 0
 	
 
 
-	FetchFile: {
-		!LoopFetchNext:
-			ldx <NextTrack
-			ldy <NextSector
-			jsr FetchNext
-			jsr CopyToBuffer
-			
-		!LoopFileRead:	
-			ldy #$00
-			lda (<BufferPtr), y 
-			sta <NextTrack
-			tax 
-			iny 
+	
+fastload_irq:
+	// If the FDC is busy, do nothing, as we can't progress.
+	// This really simplifies the state machine into a series of
+	// sector reads
+	lda fastload_request
+	bne todo
+	rts
+todo:	
+	lda $d082
+	bpl fl_fdc_not_busy
+	rts
+fl_fdc_not_busy:	
+	// FDC is not busy, so check what state we are in
+	lda fastload_request
+	bpl fl_not_in_error_state
+	rts
+fl_not_in_error_state:
+	// Shift state left one bit, so that we can use it as a lookup
+	// into a jump table.
+	// Everything else is handled by the jump table
+	cmp #6
+	bcc fl_job_ok
+	// Ignore request/status codes that don't correspond to actions
+	rts
+fl_job_ok:	
+	asl
+	tax
+	jmp (fl_jumptable,x)
+	
+fl_jumptable:
+	.word fl_idle
+	.word fl_new_request
+	.word fl_directory_scan
+	.word fl_read_file_block
+	.word fl_seek_track_0
+	.word fl_reading_sector
 
-			lda (<BufferPtr), y 
-			sta <NextSector
-			taz
-			dez
-			iny 
+fl_idle:
+	rts
 
-			lda #$fe
-			cpx #$00
-			bne !+
-			tza 
-		!:
-			sta DMACopyToDestLength
-			jsr CopyFileToPosition	
+fl_seek_track_0:
+	lda $d082
+	and #$01
+	beq fl_not_on_track_0
+	lda #$00
+	sta fastload_request
+	sta fl_current_track
+	rts
+fl_not_on_track_0:
+	// Step back towards track 0
+	lda #$10
+	sta $d081
+	rts
 
-			lda <NextTrack
-			beq !done+
+fl_select_side1:	
+	lda #$01
+	sta $d086 		// requested side
+	// Sides are inverted on the 1581
+	lda #$60
+	sta $d080 		// physical side selected of mechanical drive
+	rts
+
+fl_select_side0:	
+	lda #$00
+	sta $d086 		// requested side
+	// Sides are inverted on the 1581
+	lda #$68
+	sta $d080 		// physical side selected of mechanical drive
+	rts
+	
+	
+fl_new_request:
+	// Acknowledge fastload request
+	lda #2
+	sta fastload_request
+	// Start motor
+	lda #$60
+	sta $d080
+	// Request T40 S3 to start directory scan
+	// (remember we have to do silly translation to real sectors)
+	lda #40-1
+	sta $d084
+	lda #(3/2)+1
+	sta $d085
+	jsr fl_select_side0
+
+	// Request read
+	jsr fl_read_sector
+	rts
+	
+fl_directory_scan:
+	
+	// Check if our filename we want is in this sector
+	jsr fl_copy_sector_to_buffer
+
+	// (XXX we scan the last BAM sector as well, to keep the code simple.)
+	// filenames are at offset 4 in each 32-byte directory entry, padded at
+	// the end with $A0
+	lda #<fastload_sector_buffer
+	sta fl_buffaddr+1
+	lda #>fastload_sector_buffer
+	sta fl_buffaddr+2
+
+fl_check_logical_sector:
+	ldx #$05
+fl_filenamecheckloop:
+	ldy #$00
+
+fl_check_loop_inner:
+
+fl_buffaddr:
+	lda fastload_sector_buffer+$100,x
+	
+	cmp fastload_filename,y	
+	bne fl_filename_differs
+	inx
+	iny
+	cpy #$10
+	bne fl_check_loop_inner
+
+	// Filename matches
+fl_found_file:	
+	txa
+	sec
+	sbc #$12
+	tax
+	lda fl_buffaddr+2
+	cmp #>fastload_sector_buffer
+	bne fl_file_in_2nd_logical_sector
+	// Y=Track, A=Sector
+	lda fastload_sector_buffer,x
+	tay
+	lda fastload_sector_buffer+1,x
+	jmp fl_got_file_track_and_sector
+fl_file_in_2nd_logical_sector:
+	// Y=Track, A=Sector
+	lda fastload_sector_buffer+$100,x
+	tay
+	lda fastload_sector_buffer+$101,x
+fl_got_file_track_and_sector:
+	// Store track and sector of file
+	sty fl_file_next_track
+	sta fl_file_next_sector
+
+	// Advance to next state
+	lda #3
+	sta fastload_request
+	
+	// Request reading of next track and sector
+	jsr fl_read_next_sector
+	rts
+	
+fl_filename_differs:
+	// Skip same number of chars as though we had matched
+	cpy #$10
+	beq fl_end_of_name
+	inx
+	iny
+	jmp fl_filename_differs
+fl_end_of_name:
+	// Advance to next directory entry
+	txa
+	clc
+	adc #$10
+	tax
+	bcc fl_filenamecheckloop
+	inc fl_buffaddr+2
+	lda fl_buffaddr+2
+	cmp #[>fastload_sector_buffer]+1
+	bne fl_checked_both_halves
+	jmp fl_check_logical_sector
+fl_checked_both_halves:	
+	
+	// No matching name in this 512 byte sector.
+	// Load the next one, or give up the search
+	inc $d085
+	lda $d085
+	cmp #11
+	bne fl_load_next_dir_sector
+	// Ran out of sectors in directory track
+	// (XXX only checks side 0, and assumes DD disk)
+
+	// Mark load as failed
+	lda #$80 		// $80 = File not found
+	sta fastload_request	
+	rts
+
+fl_load_next_dir_sector:	
+	// Request read
+	jsr fl_read_sector
+	// No need to change state
+	rts
+
+fl_read_sector:
+	// Remember the state that we need to return to
+	lda fastload_request
+	sta fastload_request_stashed
+	// and then set ourselves to the track stepping/sector reading state
+	lda #5
+	sta fastload_request
+	// FALLTHROUGH
+	
+fl_reading_sector:
+	// Check if we are already on the correct track/side
+	// and if not, select/step as required
+
+	lda fl_current_track
+	lda $d084
+	cmp fl_current_track
+	beq fl_on_correct_track
+	bcc fl_step_in
+fl_step_out:
+	// We need to step first
+	lda #$18
+	sta $d081
+	inc fl_current_track
+	rts
+fl_step_in:
+	// We need to step first
+	lda #$10
+	sta $d081
+	dec fl_current_track
+	rts
+	
+fl_on_correct_track:
+
+	lda $d084
+	cmp prev_track
+	bne fl_not_prev_sector
+	lda $d086
+	cmp prev_track
+	bne fl_not_prev_sector
+	lda $d085
+	eor prev_sector
+	and #$fe
+	bne fl_not_prev_sector
+
+	// We are being asked to read the sector we already have in the buffer
+	// Jump immediately to the correct routine
+	lda fastload_request_stashed
+	sta fastload_request
+	jmp fl_fdc_not_busy
+
+fl_not_prev_sector:	
+	lda #$40
+	sta $d081
+
+	// Now that we are finally reading the sector,
+	// restore the stashed state ID
+	lda fastload_request_stashed
+	sta fastload_request
+
+	rts
+
+fl_step_track:
+	lda #3
+	sta fastload_request
+	// FALL THROUGH
+	
+fl_read_next_sector:
+	// Check if we reached the end of the file first
+	lda fl_file_next_track
+	bne fl_not_end_of_file
+	rts
+fl_not_end_of_file:	
+	// Read next sector of file	
+	jsr fl_logical_to_physical_sector
+	jsr fl_read_sector
+	rts
+
+	
+fl_logical_to_physical_sector:
+
+	// Remember current loaded sector, so that we can optimise when asked
+	// to read other half of same physical sector
+	lda $d084
+	sta prev_track
+	lda $d085
+	sta prev_sector
+	lda $d086
+	sta prev_side
+	
+	// Convert 1581 sector numbers to physical ones on the disk.
+	// Track = Track - 1
+	// Sector = 1 + (Sector/2)
+	// Side = 0
+	// If sector > 10, then sector=sector-10, side=1
+	// but sides are inverted
+	jsr fl_select_side0
+	lda fl_file_next_track
+	dec
+	sta $d084
+	lda fl_file_next_sector
+	lsr
+	inc
+	cmp #11
+	bcs fl_on_second_side
+	sta $d085
+	rts
+	
+fl_on_second_side:
+	sec
+	sbc #10
+	sta $d085
+	jsr fl_select_side1
+	rts
+	
+	
+fl_read_file_block:
+	// We have a sector from the floppy drive.
+	// Work out which half and how many bytes,
+	// and copy them into place.
+
+	// Get sector from FDC
+	jsr fl_copy_sector_to_buffer
+
+	// Assume full sector initially
+	lda #254
+	sta fl_bytes_to_copy
+	
+	// Work out which half we care about
+	lda fl_file_next_sector
+	and #$01
+	bne fl_read_from_second_half
+fl_read_from_first_half:
+	lda #(>fastload_sector_buffer)+0
+	sta fl_read_dma_page
+
+	lda fastload_sector_buffer+1
+	sta fl_file_next_sector
+	lda fastload_sector_buffer+0
+	sta fl_file_next_track
+	bne fl_1st_half_full_sector
+fl_1st_half_partial_sector:
+	lda fastload_sector_buffer+1
+	sta fl_bytes_to_copy	
+	// Mark end of loading
+	lda #$00
+	sta fastload_request
+fl_1st_half_full_sector:
+	jmp fl_dma_read_bytes
+	
+fl_read_from_second_half:
+	lda #(>fastload_sector_buffer)+1
+	sta fl_read_dma_page
+	lda fastload_sector_buffer+$101
+	sta fl_file_next_sector
+	lda fastload_sector_buffer+$100
+	sta fl_file_next_track
+	bne fl_2nd_half_full_sector
+fl_2nd_half_partial_sector:
+	lda fastload_sector_buffer+$101
+	sta fl_bytes_to_copy
+	// // Mark end of loading
+	lda #$00
+	sta fastload_request
+fl_2nd_half_full_sector:
+	// // FALLTHROUGH
+fl_dma_read_bytes:
+
+	// Update destination address
+	lda fastload_address+3
+	asl
+	asl
+	asl
+	asl
+	sta fl_data_read_dmalist+2
+	lda fastload_address+2
+	lsr
+	lsr
+	lsr
+	lsr
+	ora fl_data_read_dmalist+2
+	sta fl_data_read_dmalist+2
+	lda fastload_address+2
+	and #$0f
+	sta fl_data_read_dmalist+12
+	lda fastload_address+1
+	sta fl_data_read_dmalist+11
+	lda fastload_address+0
+	sta fl_data_read_dmalist+10
+
+	// Copy FDC data to our buffer
+	lda #$00
+	sta $d704
+	lda #>fl_data_read_dmalist
+	sta $d701
+	lda #<fl_data_read_dmalist
+	sta $d705
+
+	// Update load address
+	lda fastload_address+0
+	clc
+	adc fl_bytes_to_copy
+	sta fastload_address+0
+	lda fastload_address+1
+	adc #0
+	sta fastload_address+1
+	lda fastload_address+2
+	adc #0
+	sta fastload_address+2
+	lda fastload_address+3
+	adc #0
+	sta fastload_address+3
+	
+	// Schedule reading of next block
+	jsr fl_read_next_sector
+	
+	rts
+
+fl_data_read_dmalist:
+	.byte $0b	  // F011A type list
+	.byte $81,$00	  // Destination MB
+	.byte 0 		// no more options
+	.byte 0			// copy
+fl_bytes_to_copy:	
+	.word 0	   		// size of copy
+fl_read_page_word:	
+.label fl_read_dma_page = * + 1
+	// // +2 is to skip track/header link
+	.word fastload_sector_buffer+2	// Source address
+	.byte $00		// Source bank
+	
+	.word 0			     // Dest address
+	.byte $00		     // Dest bank
+	
+	.byte $00		     //sub-command
+	.word 0			     // modulo (unused)
+	
+	rts
+	
+fl_copy_sector_to_buffer:
+	// // Make sure FDC sector buffer is selected
+	lda #$80
+	trb $d689
+	// // Copy FDC data to our buffer
+	lda #$00
+	sta $d704
+	lda #>fl_sector_read_dmalist
+	sta $d701
+	lda #<fl_sector_read_dmalist
+	sta $d705
+	rts
+
+fl_sector_read_dmalist:
+	.byte $0b	  // F011A type list
+	.byte $80,$ff	    	// MB of FDC sector buffer address ($FFD6C00)
+	.byte 0 		// no more options
+	.byte 0			// copy
+	.word 512		// size of copy
+	.word $6c00		// low 16 bits of FDC sector buffer address
+	.byte $0d		// next 4 bits of FDC sector buffer address
+	.word fastload_sector_buffer // Dest address	
+	.byte $00		     // Dest bank
+	.byte $00		     // sub-command
+	.word 0			     // modulo (unused)
 
 
-			//Increase dest
-			clc
-			lda DMACopyToDest + 0
-			adc #$fe
-			sta DMACopyToDest + 0
-			bcc !+
-			inc DMACopyToDest + 1
-			bne !+
-			inc DMACopyToDest + 2
-		!:
-			
-
-			jsr AdvanceSectorPointer //Returns 0 if we need to fetch next sector buffer
-	  		bne !LoopFileRead-
-
-	  		//Otherwise we need to fetch new sector buffer
-	  		jmp !LoopFetchNext-
-
-		!done:
-			bra FloppyExit
-	}
-
-
-	CopyFileToPosition: {
-			lda #$02
-			clc
-			adc <SectorHalf
-			sta DMACopyToDestSource + 1
-			
-			// Execute DMA job
-			lda #$00
-			sta $d702
-			sta $d704
-			lda #>DMACopyToDestination
-			sta $d701
-			lda #<DMACopyToDestination
-			sta $d705
-			rts	
-	}
-
-
-	AdvanceSectorPointer: {
-			inc <[BufferPtr + 1]
-	  		lda <SectorHalf
-	  		eor #$01
-	  		sta <SectorHalf
-	  		rts
-	}
-
-	FetchNext: {
-			jsr ReadSector
-			bcc !+
-			// abort if the sector read failed
-		  	pla 
-		  	pla	//break out of the parent method 
-		!:
-			rts 
-	}
-
-
-	ReadSector: {	 
-	  	  	// motor and LED on
-		  	lda #$60
-		  	sta $d080
-		  	// Wait for motor spin up
-		  	lda #$20
-		  	sta $d081
-	  	
-		  	//(tracks begin at 0 not 1)
-		  	dex 
-			stx $d084 //Track
-
-			//Convert sector
-			tya 
-			lsr //Carry indicates we need second half of sector
-			tay
-			//(sectors begin at 1, not 0)
-			iny
-			sty $d085 //Sector			
-			lda #$00
-			sta $d086 //side - always 0
-			adc #$00  //Apply carry to select sector
-			sta <SectorHalf
-
-
-		  	// Read sector
- 		  	lda #$41
-		  	sta $d081
-	  		//WaitForBusy
-	  	!:
-		  	lda $d082
-		  	bmi !-
-
-	  		//Check for read error
-		  	lda $d082
-		  	and #$18
-		  	beq !+
-
-		  	// abort if the sector read failed
-		  	sec
-		  !:
-		  	rts
-	}
-
-
-	CopyToBuffer: {
-	  		jsr CopySector
-	  		ldx #$00
-	  		stx <[BufferPtr + 0]
-	  		lda #$02
-	  		//Carry is always already clear here
-	  		adc <SectorHalf
-	  		sta <[BufferPtr + 1]
-	  		rts
-	}
-
-	CopySector: {
-			//Set pointer to buffer
-			//Select FDC buffer
-			lda #$80
-			trb $d689
-
-			// Execute DMA job
-			lda #$00
-			sta $d702
-			sta $d704
-			lda #>DMACopyBuffer
-			sta $d701
-			lda #<DMACopyBuffer
-			sta $d705
-			rts	
-	}
-
-	//DMA Job to copy from buffer at $200-$3FF to destination
-	DMACopyToDestination:
-        .byte $0A  // Request format is F018A
-        .byte $80,$00 // Source is $00
-        .byte $81,$00 // Destination is $00
-        .byte $00  // No more options
-        // F018A DMA list
-        .byte $00 // copy + last request in chain
-    DMACopyToDestLength:
-        .word $00fe // size of copy
-    DMACopyToDestSource:    
-        .word $0202 // starting at
-        .byte $00   // of bank
-	DMACopyToDest:	
-        .word $0800 // destination addr
-        .byte $00   // of bank
-        // .word $0000 // modulo (unused)
-
-
-    //DMA Job to copy 512 bytes from sector buffer
-    //at $FFD6C00 to temp buffer at $200-$3ff
-	DMACopyBuffer:
-        .byte $0A  // Request format is F018A
-        .byte $80,$FF // Source MB is $FFxxxxx
-        .byte $81,$00 // Destination MB is $00xxxxx
-        .byte $00  // No more options
-        //F018A DMA list
-        .byte $00 // copy + last request in chain
-        .word $0200 // size of copy
-        .word $6C00 // starting at
-        .byte $0D   // of bank
-        .word $0200 // destination addr
-        .byte $00   // of bank
-        // .word $0000 // modulo (unused)
 
 
 
-}
+
+
+
+
+
+
+
+
+
+
